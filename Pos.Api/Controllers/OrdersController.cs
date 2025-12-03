@@ -1,4 +1,6 @@
 ﻿using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
+using Pos.Api.Data;
 using Pos.Api.Models;
 
 namespace Pos.Api.Controllers
@@ -7,58 +9,86 @@ namespace Pos.Api.Controllers
     [Route("api/[controller]")]
     public class OrdersController : ControllerBase
     {
-        // This simulates an auto-incrementing order ID.
-        // In a real app, the database would handle this.
-        private static int _nextOrderId = 1;
+        private readonly PosDbContext _db;
 
-        // We'll re-use the same hard-coded products used by ProductsController.
-        // In a real app, you'd move this to a shared service or database.
-        private static readonly List<Product> Products = new()
+        public OrdersController(PosDbContext db)
         {
-            new Product { Id = 1, Sku = "COFFEE_SMALL", Name = "Small Coffee", Price = 2.50m },
-            new Product { Id = 2, Sku = "COFFEE_LARGE", Name = "Large Coffee", Price = 3.50m },
-            new Product { Id = 3, Sku = "PASTRY",       Name = "Pastry",       Price = 4.00m }
-        };
+            _db = db;
+        }
 
+        // POST /api/orders
         [HttpPost]
-        public ActionResult<OrderResponse> CreateOrder([FromBody] CreateOrderDto dto)
+        public async Task<ActionResult<OrderResponse>> CreateOrder([FromBody] CreateOrderDto dto)
         {
             if (dto.Items == null || dto.Items.Count == 0)
             {
                 return BadRequest("Order must contain at least one item.");
             }
 
+            // default to MAIN if nothing provided
+            var locationCode = string.IsNullOrWhiteSpace(dto.LocationCode)
+                ? "MAIN"
+                : dto.LocationCode;
+
+            var location = await _db.Locations
+                .FirstOrDefaultAsync(l => l.Code == locationCode);
+
+            if (location == null)
+            {
+                return BadRequest($"Unknown location code: {locationCode}");
+            }
+
+            // load products in one query
+            var productIds = dto.Items.Select(i => i.ProductId).ToList();
+            var products = await _db.Products
+                .Where(p => productIds.Contains(p.Id))
+                .ToDictionaryAsync(p => p.Id);
+
             decimal subtotal = 0m;
+
+            var order = new Order
+            {
+                LocationId = location.Id
+            };
 
             foreach (var item in dto.Items)
             {
-                var product = Products.FirstOrDefault(p => p.Id == item.ProductId);
-                if (product == null)
+                if (!products.TryGetValue(item.ProductId, out var product))
                 {
                     return BadRequest($"Invalid product id: {item.ProductId}");
                 }
 
-                subtotal += product.Price * item.Quantity;
+                var lineTotal = product.Price * item.Quantity;
+                subtotal += lineTotal;
+
+                order.Items.Add(new OrderItem
+                {
+                    ProductId = product.Id,
+                    Quantity = item.Quantity,
+                    UnitPrice = product.Price,
+                    LineTotal = lineTotal
+                });
             }
 
-            var taxRate = 0.06m;  // 6% tax, just to have something
-            var tax = Math.Round(subtotal * taxRate, 2);
-            var total = subtotal + tax;
+            const decimal taxRate = 0.06m;
+            order.Subtotal = subtotal;
+            order.Tax = Math.Round(subtotal * taxRate, 2);
+            order.Total = order.Subtotal + order.Tax;
+            order.Status = "paid";
 
-            var orderId = _nextOrderId++;
+            _db.Orders.Add(order);
+            await _db.SaveChangesAsync();
+
             var response = new OrderResponse
             {
-                Id = orderId,
-                Subtotal = subtotal,
-                Tax = tax,
-                Total = total,
-                Status = "paid",                   // we’ll hook real payment in later
-                LocationCode = dto.LocationCode,
-                CreatedAtUtc = DateTime.UtcNow
+                Id = order.Id,
+                Subtotal = order.Subtotal,
+                Tax = order.Tax,
+                Total = order.Total,
+                Status = order.Status,
+                LocationCode = location.Code,
+                CreatedAtUtc = order.CreatedAtUtc
             };
-
-            // Log to console so you can see it in the output window.
-            Console.WriteLine($"[ORDER] #{response.Id} Location={response.LocationCode} Total={response.Total}");
 
             return Ok(response);
         }
